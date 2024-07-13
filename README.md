@@ -1,168 +1,156 @@
 # Messaging System with RabbitMQ/Celery and Python Application behind Nginx
 
-## Objective
-Deploy a Python application behind Nginx that interacts with RabbitMQ/Celery for email sending and logging functionality.
+## Here’s how you can set up the Python application with RabbitMQ/Celery for email sending and logging functionality, and configure it behind Nginx.
 
-## Requirements
+### Step 1: Install RabbitMQ and Celery
+Install RabbitMQ and Celery on your local machine:
 
-### Local Setup
+#### RabbitMQ Installation
+- **Ubuntu/Debian**:
+  ```sh
+  sudo apt-get update
+  sudo apt-get install rabbitmq-server
+  sudo systemctl enable rabbitmq-server
+  sudo systemctl start rabbitmq-server
+  ```
+- **MacOS**:
+  ```sh
+  brew install rabbitmq
+  brew services start rabbitmq
+  ```
 
-1. **Install RabbitMQ and Celery**
-   - **RabbitMQ:** Follow the [RabbitMQ installation guide](https://www.rabbitmq.com/download.html) for your OS.
-   - **Celery:** Install using pip:
-     ```sh
-     pip install celery
-     ```
+#### Celery Installation
+Install Celery using pip:
+```sh
+pip install celery
+```
 
-### Python Application Development
+### Step 2: Set up a Python Application
+Create a Python application with the necessary functionalities:
 
-Create a Python application (`app.py`) with the following functionalities:
+#### Directory Structure
+```
+myapp/
+│
+├── app.py
+├── tasks.py
+├── requirements.txt
+└── celeryconfig.py
+```
 
-#### Endpoint Functionalities
-
-1. **`?sendmail`**
-   - Sends an email using SMTP to the provided value (e.g., `?sendmail=destiny@destinedcodes.com`).
-   - Uses RabbitMQ/Celery to queue the email sending task.
-   - The email-sending script retrieves and executes tasks from the queue.
-
-2. **`?talktome`**
-   - Logs the current time to `/var/log/messaging_system.log`.
-
-3. **`/logs`**
-   - Displays the application logs in real-time.
-
-#### Python Application Code
+#### app.py
 ```python
-from flask import Flask, request, Response, stream_with_context
-from celery import Celery
-from datetime import datetime
-import smtplib
+from flask import Flask, request
+from tasks import send_mail, log_message
 import logging
-import os
 
 app = Flask(__name__)
 
-# Configure Celery
-app.config['CELERY_BROKER_URL'] = 'pyamqp://guest@localhost//'
-app.config['CELERY_RESULT_BACKEND'] = 'rpc://'
-celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
-celery.conf.update(app.config)
-
-# Set up logging
-log_file = '/tmp/messaging_system.log'  # Change to a writable location
-logging.basicConfig(filename=log_file, level=logging.INFO)
-
-@celery.task
-def send_email(recipient):
-    sender = "your_email@example.com"
-    message = f"Subject: Hello\n\nThis is a test email to {recipient}."
-    with smtplib.SMTP('smtp.example.com', 587) as server:
-        server.starttls()
-        server.login(sender, 'your_password')
-        server.sendmail(sender, recipient, message)
+logging.basicConfig(filename='/var/log/messaging_system.log', level=logging.INFO)
 
 @app.route('/')
-def home():
+def index():
     sendmail = request.args.get('sendmail')
     talktome = request.args.get('talktome')
+    
     if sendmail:
-        send_email.delay(sendmail)
-        return f"Email queued to {sendmail}"
-    elif talktome:
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        logging.info(f"Current time logged: {now}")
-        return "Logged the current time."
-    return "Welcome to the messaging system!"
+        send_mail.delay(sendmail)
+        return f"Email to {sendmail} queued."
+    
+    if talktome:
+        log_message.delay()
+        return "Message logged."
 
-@app.route('/logs')
-def logs():
-    def generate():
-        with open(log_file, 'r') as f:
-            while True:
-                line = f.readline()
-                if not line:
-                    break
-                yield line
-    return Response(stream_with_context(generate()), mimetype='text/plain')
+    return "Hello, use ?sendmail=<email> or ?talktome"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    app.run(debug=True)
 ```
 
-### Nginx Configuration
+#### tasks.py
+```python
+from celery import Celery
+import smtplib
+import logging
+from datetime import datetime
 
-Configure Nginx to serve your Python application.
+app = Celery('tasks', broker='pyamqp://guest@localhost//')
 
-#### `nginx.conf`
+@app.task
+def send_mail(email):
+    with smtplib.SMTP('localhost') as server:
+        server.sendmail('youremail@example.com', email, 'Subject: Test\n\nThis is a test email.')
+        print(f"Email sent to {email}")
+
+@app.task
+def log_message():
+    logging.info(f"Current time: {datetime.now()}")
+    print("Message logged")
+```
+
+#### celeryconfig.py
+```python
+broker_url = 'pyamqp://guest@localhost//'
+result_backend = 'rpc://'
+```
+
+#### requirements.txt
+```txt
+Flask
+celery
+```
+
+Install the requirements:
+```sh
+pip install -r requirements.txt
+```
+
+### Step 3: Configure Nginx
+
+#### nginx.conf
 ```nginx
-user  nginx;
-worker_processes  1;
+server {
+    listen 80;
+    server_name localhost;
 
-error_log  /var/log/nginx/error.log warn;
-pid        /var/run/nginx.pid;
-
-events {
-    worker_connections  1024;
-}
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-
-    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
-                      '$status $body_bytes_sent "$http_referer" '
-                      '"$http_user_agent" "$http_x_forwarded_for"';
-
-    access_log  /var/log/nginx/access.log  main;
-
-    sendfile        on;
-    #tcp_nopush     on;
-
-    keepalive_timeout  65;
-
-    #gzip  on;
-
-    upstream flask_app {
-        server localhost:8000;
-    }
-
-    server {
-        listen 80;
-        server_name localhost;
-
-        location / {
-            proxy_pass http://flask_app;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-        }
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
 
-### Endpoint Access
+Start Nginx:
+```sh
+sudo nginx -s reload
+```
 
-1. **Expose Local Application**
-   - Use ngrok to expose your local application endpoint:
-     ```sh
-     ./ngrok http 80
-     ```
-   - This will provide a URL to access your application externally.
+### Step 4: Expose Application Using ngrok
+Install ngrok and expose the local application:
 
-### Submission Requirements
+```sh
+ngrok http 80
+```
 
-1. Provide the ngrok (or equivalent) endpoint for testing.
-2. Submit a screen recording walk-through.
-3. Ensure all requirements are met and the application functions correctly.
+ngrok will provide a stable endpoint to access your application externally.
 
-### Evaluation Criteria
+### Running the Application
+1. Start RabbitMQ server:
+   ```sh
+   sudo systemctl start rabbitmq-server
+   ```
 
-1. **Functionality:** All specified features must work correctly.
-2. **Clarity:** Code and configurations must be well-documented.
-3. **Presentation:** The screen recording should be clear and comprehensive.
-4. **Deadline Adherence:** Strict deadline, no late submissions accepted.
+2. Start the Celery worker:
+   ```sh
+   celery -A tasks worker --loglevel=info
+   ```
 
----
+3. Start the Flask application:
+   ```sh
+   python3 app.py
+   ```
 
-This README provides a comprehensive guide for setting up a messaging system with a Python application behind Nginx, using RabbitMQ/Celery for email sending and logging functionality. Follow each step to ensure your application meets the requirements and functions correctly.
+Now you can access the endpoints using the URL provided by ngrok, e.g., `http://your_ngrok_url/?sendmail=example@example.com` or `http://your_ngrok_url/?talktome`. This setup will queue email sending tasks and log messages to a file.
